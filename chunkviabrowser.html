@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SDB Chunk Combiner (Barebones)</title>
+<style>
+  body {
+    background: #121212;
+    color: #eee;
+    font-family: monospace, monospace;
+    padding: 1rem;
+  }
+  button {
+    background: #222;
+    color: #eee;
+    border: none;
+    padding: 0.5rem 1rem;
+    margin-top: 1rem;
+    cursor: pointer;
+  }
+  pre {
+    background: #1e1e1e;
+    padding: 1rem;
+    white-space: pre-wrap;
+    max-height: 200px;
+    overflow-y: auto;
+    margin-top: 1rem;
+  }
+  input {
+    background: #222;
+    color: #eee;
+    border: none;
+    padding: 0.5rem;
+  }
+</style>
+</head>
+<body>
+
+<h1>SDB Chunk Combiner</h1>
+
+<input type="file" id="fileInput" accept=".html" multiple />
+<br />
+<button onclick="processFiles()">Combine & Download</button>
+
+<pre id="output"></pre>
+
+<script>
+const CHUNK_SIZE = 25;
+
+// Updated page number extraction regex: matches any <option> with selected attribute, capturing the number inside
+function extractPageNumber(content) {
+  const regex = /<option\b[^>]*\bselected\b[^>]*>(\d+)<\/option>/i;
+  const match = content.match(regex);
+  if (match) return parseInt(match[1], 10);
+  return null;
+}
+
+function fixQuantityQuotes(content) {
+  return content.replace(/data-total_count="(\d+)"/g, "data-total_count='$1'");
+}
+
+function extractValidRows(content) {
+  content = fixQuantityQuotes(content);
+  const rowRegex = /<tr.*?>[\s\S]*?back_to_inv\[\d+\][\s\S]*?<\/tr>/gi;
+  const rows = content.match(rowRegex);
+  if (!rows) return null;
+
+  return `
+<html>
+<head><title>Safety Deposit Box</title></head>
+<body>
+<!-- free safety deposit box! -->
+<table>
+${rows.join('\n')}
+</table>
+</body>
+</html>
+  `;
+}
+
+function readFileAsText(file) {
+  return new Promise((res, rej) => {
+    const reader = new FileReader();
+    reader.onload = e => res(e.target.result);
+    reader.onerror = e => rej(e);
+    reader.readAsText(file);
+  });
+}
+
+function downloadFile(filename, content) {
+  const blob = new Blob([content], {type: 'text/html'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function processFiles() {
+  const output = document.getElementById('output');
+  output.textContent = '';
+  const input = document.getElementById('fileInput');
+  if (input.files.length === 0) {
+    output.textContent = '❌ No files selected.';
+    return;
+  }
+
+  let files = Array.from(input.files);
+  let pageMap = new Map();
+
+  // Read files & map page number -> content
+  for (let file of files) {
+    let content;
+    try {
+      content = await readFileAsText(file);
+    } catch {
+      output.textContent += `⚠️ Failed reading ${file.name}\n`;
+      continue;
+    }
+    const pageNum = extractPageNumber(content);
+    if (pageNum === null) {
+      output.textContent += `⚠️ Could not find page number in ${file.name}\n`;
+      continue;
+    }
+    if (pageMap.has(pageNum)) {
+      output.textContent += `⚠️ Duplicate page number ${pageNum} in ${file.name} (ignored)\n`;
+      continue;
+    }
+    pageMap.set(pageNum, content);
+  }
+
+  if (pageMap.size === 0) {
+    output.textContent += '❌ No valid pages found.\n';
+    return;
+  }
+
+  const allPages = [...pageMap.keys()].sort((a,b) => a-b);
+  const firstPage = allPages[0];
+  const lastPage = allPages[allPages.length - 1];
+  const expectedPages = new Set();
+  for(let i = firstPage; i <= lastPage; i++) expectedPages.add(i);
+
+  const missingPages = [...expectedPages].filter(p => !pageMap.has(p));
+  if (missingPages.length > 0) {
+    output.textContent += `❌ Missing pages detected: ${missingPages.join(', ')}\nAborting.\n`;
+    return;
+  }
+
+  // Chunk and combine
+  const sortedPages = allPages;
+  const numChunks = Math.ceil(sortedPages.length / CHUNK_SIZE);
+
+  for(let i=0; i<numChunks; i++) {
+    const chunkPages = sortedPages.slice(i*CHUNK_SIZE, (i+1)*CHUNK_SIZE);
+    let combined = '';
+    for(let p of chunkPages) {
+      const trimmed = extractValidRows(pageMap.get(p));
+      if(trimmed) combined += trimmed + '\n\n';
+    }
+    if(combined.trim()) {
+      const filename = `combined_chunk_${i+1}.txt`;
+      downloadFile(filename, combined);
+      output.textContent += `✅ Chunk ${i+1} (Pages ${chunkPages[0]}–${chunkPages[chunkPages.length-1]}) downloaded.\n`;
+    } else {
+      output.textContent += `⚠️ Chunk ${i+1} empty. Skipped.\n`;
+    }
+  }
+}
+</script>
+
+</body>
+</html>
