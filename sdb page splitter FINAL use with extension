@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SDB Chunk Combiner (Improved with Dedup & Prompt)</title>
+  <style>
+    body {
+      background: #121212;
+      color: #eee;
+      font-family: monospace, monospace;
+      padding: 1rem;
+      line-height: 1.4;
+    }
+    label, button {
+      display: inline-block;
+      margin-top: 1rem;
+      font-weight: bold;
+    }
+    input[type="file"] {
+      margin-top: 0.5rem;
+      background: #222;
+      color: #eee;
+      border: none;
+      padding: 0.5rem;
+      font-family: monospace, monospace;
+    }
+    button {
+      background: #222;
+      color: #eee;
+      border: none;
+      padding: 0.5rem 1rem;
+      cursor: pointer;
+      font-family: monospace, monospace;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    pre {
+      background: #1e1e1e;
+      padding: 1rem;
+      white-space: pre-wrap;
+      max-height: 250px;
+      overflow-y: auto;
+      margin-top: 1rem;
+      border-radius: 4px;
+    }
+    #dropArea {
+      border: 2px dashed #444;
+      border-radius: 8px;
+      padding: 20px;
+      margin-top: 1rem;
+      text-align: center;
+      color: #888;
+      font-size: 1.2em;
+      cursor: pointer;
+      transition: background-color 0.3s ease;
+    }
+    #dropArea.highlight {
+      background-color: #2a2a2a;
+      border-color: #666;
+    }
+  </style>
+</head>
+<body>
+  <h1>SDB Chunk Combiner</h1>
+  <label for="fileInput">Select Safety Deposit Box HTML pages (.html):</label><br>
+  <input type="file" id="fileInput" accept=".html" multiple aria-describedby="instructions"><br>
+  <button id="combineBtn" disabled>Combine & Download</button>
+  <div id="dropArea">Drag & Drop Files Here</div>
+  <pre id="output" aria-live="polite" aria-atomic="true"></pre>
+
+  <script>
+    (() => {
+      const CHUNK_SIZE = 25; // pages per chunk
+      const ROWS_PER_PAGE = 30; // items per page (Note: Not directly used for chunking logic, but useful info)
+
+      // Static category ID to name mapping
+      const CATEGORY_MAP = {
+        "15": "Album Item", "11": "Battledome Equipment", "6": "Books", "19": "Clothes",
+        "2": "Codestones", "14": "Collectable Card", "9": "Cures", "3": "Dubloons",
+        "18": "Food", "21": "Gift", "10": "Grooming", "25": "Instruments",
+        "12": "Magic Item", "13": "Meridell Potion", "-1": "Neocash", "8": "Neogarden",
+        "7": "Neohome", "0": "None", "1": "Paint Brush", "4": "Petpet",
+        "26": "Petpetpet", "29": "Petpetpet Habitats", "24": "School",
+        "20": "Special", "22": "Tiki Tack", "5": "Toys", "16": "Trading Card",
+        "23": "Utility Fish", "27": "World Challenge"
+      };
+
+      const fileInput = document.getElementById('fileInput');
+      const combineBtn = document.getElementById('combineBtn');
+      const output = document.getElementById('output');
+      const dropArea = document.getElementById('dropArea'); // New drop area element
+
+      // Event listeners for file input and button
+      fileInput.addEventListener('change', () => {
+        combineBtn.disabled = fileInput.files.length === 0;
+        clearOutput();
+      });
+
+      combineBtn.addEventListener('click', () => {
+        // Use fileInput.files which will be populated by drag/drop or manual selection
+        processFiles(fileInput.files);
+      });
+
+      // Event listeners for drag and drop
+      ['dragenter', 'dragover'].forEach(eventName => {
+        dropArea.addEventListener(eventName, preventDefaults, false);
+      });
+      ['dragleave', 'drop'].forEach(eventName => {
+        dropArea.addEventListener(eventName, preventDefaults, false);
+      });
+
+      dropArea.addEventListener('dragenter', () => dropArea.classList.add('highlight'), false);
+      dropArea.addEventListener('dragleave', () => dropArea.classList.remove('highlight'), false);
+      dropArea.addEventListener('drop', (e) => {
+        dropArea.classList.remove('highlight');
+        const dt = e.dataTransfer;
+        const files = dt.files;
+        // Assign dropped files to the fileInput element
+        fileInput.files = files; 
+        combineBtn.disabled = fileInput.files.length === 0;
+        clearOutput();
+      }, false);
+
+      function preventDefaults(e) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+
+      function clearOutput() {
+        output.textContent = '';
+      }
+
+      function log(msg) {
+        output.textContent += msg + '\n';
+      }
+
+      // Read file as text Promise wrapper
+      function readFileAsText(file) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = e => resolve(e.target.result);
+          reader.onerror = e => reject(e);
+          reader.readAsText(file);
+        });
+      }
+
+      // Extract page number from <option ... selected>NUMBER</option>
+      function extractPageNumber(html) {
+        const match = html.match(/<option\b[^>]*\bselected\b[^>]*>(\d+)<\/option>/i);
+        return match ? Number(match[1]) : null;
+      }
+
+      // Fix double quotes around data-total_count to single quotes
+      function fixQuantityQuotes(html) {
+        return html.replace(/data-total_count="(\d+)"/g, "data-total_count='$1'");
+      }
+
+      // Extract category ID/name and search string (obj_name) from the HTML content
+      function extractCategoryAndSearch(html) {
+        const catMatch = html.match(
+          /<select[^>]*name=['"]?category['"]?[^>]*>[\s\S]*?<option\s+value=['"]?(-?\d+)['"]?\s+selected[^>]*>([^<]+)<\/option>/i
+        );
+        const categoryID = catMatch ? catMatch[1] : "0";
+        const categoryName = CATEGORY_MAP[categoryID] || "None";
+
+        const searchMatch = html.match(
+          /<input[^>]*name=['"]obj_name['"][^>]*value=['"]([^'"]*)['"][^>]*>/i
+        );
+        const searchString = searchMatch ? searchMatch[1].trim().toLowerCase() : "";
+
+        return { categoryID, categoryName, searchString };
+      }
+
+      // Extract all valid item rows containing back_to_inv[itemID]
+      function extractValidRows(html) {
+        html = fixQuantityQuotes(html);
+        const rows = html.match(/<tr[^>]*>[\s\S]*?back_to_inv\[(\d+)\][\s\S]*?<\/tr>/gi);
+        return rows || [];
+      }
+
+      // Get item ID from row
+      function getItemIdFromRow(row) {
+        const idMatch = row.match(/back_to_inv\[(\d+)\]/);
+        return idMatch ? idMatch[1] : null;
+      }
+
+      // Extract item name from row (simplified)
+      function extractItemName(row) {
+        // Try to extract item name from <a ... title="..."> or <td class="name">...</td>
+        let nameMatch = row.match(/<a[^>]+title=['"]([^'"]+)['"]/i);
+        if (nameMatch) return nameMatch[1].trim();
+
+        nameMatch = row.match(/<td[^>]*class=['"]?name['"]?[^>]*>([^<]+)<\/td>/i);
+        if (nameMatch) return nameMatch[1].trim();
+
+        // Fallback: try to extract any text inside the first <td> cell
+        nameMatch = row.match(/<td[^>]*>([^<]+)<\/td>/i);
+        return nameMatch ? nameMatch[1].trim() : 'Unknown Item';
+      }
+
+      // Construct full valid HTML page from item rows and optional comment header
+      function buildHtmlFromRows(rows, commentLines = []) {
+        // Add newlines before and after the comment block only if comments exist
+        const commentBlock = commentLines.length > 0
+          ? `\n` // No extra newline at the end of comment block itself
+          : '';
+
+        return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Safety Deposit Box</title>
+  <script>
+    var pageIdentifier = 'free safety deposit box!';
+    var itemPattern = "back_to_inv\\[([0-9]+)\\]";
+    var itemPatternType = "item_id";
+    var quantityPattern = "data-total_count='([0-9]+)'";
+  </scr` + `ipt> </head>
+<body>
+${commentBlock}
+${rows.join('\n')}
+</body>
+</html>`;
+      }
+
+      // Trigger download of file with given content
+      function downloadFile(filename, content) {
+        const blob = new Blob([content], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+          URL.revokeObjectURL(url);
+          document.body.removeChild(a);
+        }, 100);
+      }
+
+      // Main processing function
+      async function processFiles(files) {
+        clearOutput();
+        log(`Reading ${files.length} files...`);
+        const allLoadedPages = [];
+
+        for (const file of files) {
+          try {
+            const html = await readFileAsText(file);
+            const pageNumber = extractPageNumber(html);
+            if (pageNumber === null) {
+              log(`Warning: Could not find page number in ${file.name}, skipping.`);
+              continue;
+            }
+            const { categoryID, categoryName, searchString } = extractCategoryAndSearch(html);
+            const rows = extractValidRows(html);
+            if (rows.length === 0) {
+              log(`Warning: No valid items found in ${file.name}.`);
+              continue;
+            }
+            allLoadedPages.push({
+              filename: file.name,
+              pageNumber,
+              categoryID,
+              categoryName,
+              searchString,
+              rows,
+            });
+            log(`Loaded page ${pageNumber} from ${file.name} (Cat: ${categoryName}, Search: "${searchString}") with ${rows.length} items.`);
+          } catch (err) {
+            log(`Error reading ${file.name}: ${err.message}`);
+          }
+        }
+
+        if (allLoadedPages.length === 0) {
+          log("No valid pages loaded. Aborting.");
+          return;
+        }
+
+        // Determine if any page is from a custom search (categoryID != 0 or searchString non-empty)
+        const anyCustomSearchDetected = allLoadedPages.some(p => p.categoryID !== "0" || p.searchString !== "");
+
+        let pagesToProcess = [];
+
+        if (anyCustomSearchDetected) {
+            const confirmationMessage = "Custom search pages were detected. If you have also uploaded general SDB pages (no category/no search filter), they will be ignored in favor of processing only the custom search results. Do you wish to continue?";
+            if (!confirm(confirmationMessage)) {
+                log("Processing cancelled by user.");
+                return; // Stop execution if user cancels
+            }
+            log("User confirmed. Filtering out general SDB pages (no category/no search string).");
+            pagesToProcess = allLoadedPages.filter(p => p.categoryID !== "0" || p.searchString !== "");
+            if (pagesToProcess.length === 0) {
+                log("No custom search pages found after filtering. Aborting.");
+                return;
+            }
+        } else {
+            // No custom searches detected at all, process all loaded pages in normal mode
+            log("No custom searches detected. Combining all loaded pages in chunks, preserving original SDB page order...");
+            pagesToProcess = allLoadedPages;
+        }
+
+
+        // IMPORTANT: For both normal and custom modes, sort the pages by their page number
+        // This ensures items from earlier pages are processed before items from later pages.
+        pagesToProcess.sort((a, b) => a.pageNumber - b.pageNumber);
+
+
+        if (!anyCustomSearchDetected) {
+          // Normal mode: combine pages in chunks of CHUNK_SIZE (e.g. 25 pages)
+          let chunkCounter = 1; // Added for chunk numbering
+          for (let i = 0; i < pagesToProcess.length; i += CHUNK_SIZE) {
+            const chunkPages = pagesToProcess.slice(i, i + CHUNK_SIZE);
+            const allRows = chunkPages.flatMap(p => p.rows); // flatMap preserves the order of `p.rows` from each `p`
+            
+            // Updated filename for normal mode
+            const filename = `combined_chunk_${chunkCounter}.txt`;
+            const html = buildHtmlFromRows(allRows);
+            downloadFile(filename, html);
+            log(`Downloaded chunk: ${filename} (${allRows.length} items)`);
+            chunkCounter++; // Increment chunk counter
+          }
+          log("All done.");
+          return;
+        }
+
+        // Custom search mode: group pages by unique search key: categoryID + searchString
+        log("Proceeding with custom search pages. Grouping by category+search...");
+        // Create map: key -> {categoryID, categoryName, searchString, pages: [], rows: []}
+        const groupMap = new Map();
+
+        for (const p of pagesToProcess) { // Use pagesToProcess here (already sorted by pageNumber)
+          const key = `cat${p.categoryID}_str_${p.searchString}`;
+          if (!groupMap.has(key)) {
+            groupMap.set(key, {
+              categoryID: p.categoryID,
+              categoryName: p.categoryName,
+              searchString: p.searchString,
+              pages: [],
+              rows: [], // This will hold the filtered rows after deduplication
+            });
+          }
+          const group = groupMap.get(key);
+          group.pages.push(p);
+          // For initial population of rows, we'll use all rows from all pages in the group
+          // The order here *should* be maintained because pagesToProcess is sorted and push preserves order.
+          group.rows.push(...p.rows);
+        }
+
+        // Now handle duplicates across groups
+        // Build itemID => groups map
+        const itemIdToGroups = new Map(); // itemId => Set<groupKey>
+        for (const [key, group] of groupMap.entries()) {
+          for (const row of group.rows) {
+            const itemId = getItemIdFromRow(row);
+            if (!itemId) continue;
+            if (!itemIdToGroups.has(itemId)) itemIdToGroups.set(itemId, new Set());
+            itemIdToGroups.get(itemId).add(key);
+          }
+        }
+
+        // Find duplicates: items appearing in more than one group
+        const duplicates = [];
+        for (const [itemId, groupSet] of itemIdToGroups.entries()) {
+          if (groupSet.size > 1) {
+            duplicates.push({ itemId, groups: Array.from(groupSet) });
+          }
+        }
+        log(`Found ${duplicates.length} duplicate items across groups.`);
+
+        // --- Simplified Duplicate Handling: Warning only, keep in all relevant files ---
+        if (duplicates.length > 0) {
+            let duplicateWarningMsg = `WARNING: ${duplicates.length} item(s) appear in multiple different custom search results.\n\n`;
+            duplicateWarningMsg += `For this version, these items will be included in ALL relevant output files.\n\n`;
+            duplicateWarningMsg += `Please be aware that some of your exported chunks/files will have the same item(s) appearing in them.\n\n`;
+            duplicateWarningMsg += `Item IDs detected as duplicates: ${duplicates.map(d => d.itemId).join(', ')}.`;
+            alert(duplicateWarningMsg);
+            log("User acknowledged duplicate warning. Proceeding to output chunks, keeping duplicates in all relevant files.");
+            // No filtering or removal of rows needed here, as we intend to keep them in all.
+        } else {
+          log("No duplicates to resolve.");
+        }
+        // --- End Simplified Duplicate Handling ---
+
+
+        // Output final chunks based on the original group.rows (no filtering in simplified mode)
+        for (const [key, group] of groupMap.entries()) {
+          let currentChunkStart = 0;
+          let partCounter = 1;
+          const rowsPerOutputChunk = ROWS_PER_PAGE * CHUNK_SIZE; // Max items per output file
+
+          while (currentChunkStart < group.rows.length) {
+            const chunkedRows = group.rows.slice(currentChunkStart, currentChunkStart + rowsPerOutputChunk);
+
+            // Prepare comment lines for each *part* (only if there were duplicates detected overall)
+            const commentLines = [];
+            if (duplicates.length > 0) {
+              commentLines.push(`NOTE: This file may contain items also present in other custom search files due to duplicates across groups.`);
+            }
+            
+            // Build filename label for custom search mode, including part number
+            const labelParts = [];
+            if (group.categoryName && group.categoryName !== "None") labelParts.push(group.categoryName.replace(/\s+/g, ''));
+            if (group.searchString) labelParts.push(group.searchString.replace(/\s+/g, ''));
+            const baseLabel = labelParts.join('_') || 'NoSearch';
+            const filename = `${baseLabel}_part_${partCounter}.txt`;
+
+            const html = buildHtmlFromRows(chunkedRows, commentLines);
+            downloadFile(filename, html);
+            log(`Downloaded chunk: ${filename} (${chunkedRows.length} items)`);
+
+            currentChunkStart += rowsPerOutputChunk;
+            partCounter++;
+          }
+        }
+        log("All done.");
+      }
+    })();
+  </script>
+</body>
+</html>
