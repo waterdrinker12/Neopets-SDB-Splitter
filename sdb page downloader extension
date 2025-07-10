@@ -1,0 +1,126 @@
+// ==UserScript==
+// @name         Neopets SDB Page Downloader
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  Adds a button to download the current Neopets SDB page HTML for use with the SDB Chunk Combiner.
+// @match        *://www.neopets.com/safetydeposit.phtml*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // Function to extract the current page number from the SDB HTML
+    function extractPageNumber() {
+        // Look for the selected option in the page dropdown
+        const pageOption = document.querySelector('select[name="offset"] option[selected]');
+        if (pageOption) {
+            return pageOption.textContent.trim(); // Get the text content which is the page number
+        }
+        // Fallback for the first page if no 'selected' attribute is explicitly set,
+        // or if it's the only page and no dropdown exists (though unlikely for SDB)
+        const currentOffsetMatch = window.location.search.match(/offset=(\d+)/);
+        if (currentOffsetMatch) {
+            // Neopets offset is 0-indexed for the first item, so (offset / 30) + 1 gives page number
+            return (parseInt(currentOffsetMatch[1], 10) / 30) + 1;
+        }
+        // If no offset in URL and no selected option, assume page 1 (e.g., first page loaded directly)
+        return '1';
+    }
+
+    // Function to create and append the download button
+    function addDownloadButton() {
+        // Target the <td> that contains the first "Next" link.
+        // Based on the provided HTML, this is the <td> with align="right" in the first table.
+        const nextLinkContainerTd = document.querySelector('table[width="100%"][cellpadding="0"][cellspacing="0"][border="0"] > tbody > tr > td[align="right"]');
+
+        let targetInsertionPoint = nextLinkContainerTd;
+
+        // Fallback if the specific TD isn't found (e.g., on the last page where "Next" isn't present, or structure changed)
+        if (!targetInsertionPoint) {
+            // Try to find the <td> containing the "Items: X | Qty: Y" text as a secondary option
+            targetInsertionPoint = document.evaluate(
+                "//td[contains(., 'Items:') and contains(., 'Qty:')]",
+                document,
+                null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE,
+                null
+            ).singleNodeValue;
+        }
+
+        // Final fallback if no specific target is found
+        if (!targetInsertionPoint) {
+            targetInsertionPoint = document.getElementById('content') || document.querySelector('form[name="boxform"]') || document.body;
+        }
+
+        const downloadButton = document.createElement('button');
+        downloadButton.textContent = 'Download Page HTML';
+        downloadButton.style.cssText = `
+            /* Adjusted size: a bit bigger */
+            padding: 8px 16px; /* Increased padding */
+            font-size: 14px; /* Increased font size */
+
+            /* Positioning: ensure it's on its own line within the TD */
+            margin-top: 5px; /* Space from the text above it */
+            margin-left: auto; /* Center horizontally if in a block context */
+            margin-right: auto;
+            display: block; /* Forces it onto its own line within the TD */
+            width: fit-content; /* Adjust width to content */
+
+            /* Existing styles */
+            background-color: #4CAF50; /* Green */
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-family: 'Verdana', sans-serif;
+            box-shadow: 1px 1px 3px rgba(0,0,0,0.2); /* Smaller shadow */
+            transition: background-color 0.2s;
+        `;
+        downloadButton.onmouseover = function() { this.style.backgroundColor = '#45a049'; };
+        downloadButton.onmouseout = function() { this.style.backgroundColor = '#4CAF50'; };
+
+        downloadButton.addEventListener('click', () => {
+            const pageHTML = document.documentElement.outerHTML;
+            const pageNumber = extractPageNumber();
+            const filename = `Neopets_SDB_Page_${pageNumber}.html`;
+
+            const blob = new Blob([pageHTML], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a); // Temporarily append to body to trigger download
+            a.click();
+            document.body.removeChild(a); // Clean up
+            URL.revokeObjectURL(url); // Release the object URL
+        });
+
+        // Insert the button
+        if (nextLinkContainerTd) {
+            // Find the <a> tag for "Next" within this TD
+            const nextLink = nextLinkContainerTd.querySelector('a[href*="offset="]');
+            if (nextLink) {
+                // Insert the button before the "Next" link, and add a <br> for spacing
+                nextLinkContainerTd.insertBefore(downloadButton, nextLink);
+                nextLinkContainerTd.insertBefore(document.createElement('br'), nextLink);
+            } else {
+                // If 'Next' link not found in the expected TD, just append the button
+                // This might happen on the last page.
+                nextLinkContainerTd.appendChild(document.createElement('br'));
+                nextLinkContainerTd.appendChild(downloadButton);
+            }
+        } else if (targetInsertionPoint && targetInsertionPoint.parentNode) {
+            // Fallback: insert after the targetInsertionPoint if it has a parent
+            targetInsertionPoint.parentNode.insertBefore(downloadButton, targetInsertionPoint.nextSibling);
+        } else {
+            // Final fallback: prepend to the target element itself (e.g., #content or body)
+            targetInsertionPoint.prepend(downloadButton);
+        }
+    }
+
+    // Run the function when the page loads
+    window.addEventListener('load', addDownloadButton);
+
+})();
